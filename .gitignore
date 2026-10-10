@@ -1,0 +1,24 @@
+# Maven 构建输出
+target/
+
+# 运行时产物
+mcp-audit.log
+*.log
+
+# restore.sh 的备份目录（恢复实现时自动生成）
+.mine/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.classpath
+.project
+.settings/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini

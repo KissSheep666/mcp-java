@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.example.mcp</groupId>
+  <artifactId>mcp-java-tutorial</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+  <name>MCP Java Tutorial</name>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- MCP 官方 Java SDK。2.0.0 是当前稳定版，对应 MCP 规范 2025-11-25 -->
+    <mcp.sdk.version>2.0.0</mcp.sdk.version>
+    <!-- Anthropic 官方 Java SDK -->
+    <anthropic.sdk.version>2.34.0</anthropic.sdk.version>
+
+    <!--
+      传给被测程序的参数。
+      为什么不用标准的 -Dexec.args？因为它会被 exec 插件插到【主类名之前】，
+      结果 java 把参数当成了主类名，报 ClassNotFoundException。
+      用自定义属性显式放进 <arguments> 里，位置才对。
+      用法：-DappArgs="你的问题"
+    -->
+    <appArgs></appArgs>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <!-- BOM：统一管理 mcp / mcp-core / mcp-json-* 等模块的版本 -->
+      <dependency>
+        <groupId>io.modelcontextprotocol.sdk</groupId>
+        <artifactId>mcp-bom</artifactId>
+        <version>${mcp.sdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <!-- 便捷包：= mcp-core + Jackson3 JSON 实现，含 STDIO / Streamable HTTP 传输 -->
+    <dependency>
+      <groupId>io.modelcontextprotocol.sdk</groupId>
+      <artifactId>mcp</artifactId>
+    </dependency>
+
+    <!-- 调用 Claude 用 -->
+    <dependency>
+      <groupId>com.anthropic</groupId>
+      <artifactId>anthropic-java</artifactId>
+      <version>${anthropic.sdk.version}</version>
+    </dependency>
+
+    <!--
+      H2：内存数据库，纯 Java、零安装。
+      用它只是为了让示例自包含——换成你真实的库，
+      只需要改 Db.java 里的 JDBC URL 和账号，其他代码一行不用动。
+    -->
+    <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <version>2.3.232</version>
+    </dependency>
+
+    <!--
+      日志。必须走 stderr！
+      STDIO 传输把 stdout 当作 JSON-RPC 通道，任何打到 stdout 的日志
+      都会污染协议流，导致客户端解析失败。slf4j-simple 默认输出到 System.err，
+      正好安全。这是 MCP 新手最常踩的坑。
+    -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>2.0.16</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!--
+        用 exec:exec 而不是 exec:java，是这里的关键。
+        exec:java 在同进程里跑，System.getProperty("java.class.path") 不可靠；
+        exec:exec 是真的 fork 一个 java 进程，classpath 是真的，
+        于是 step2 / step4 才能用同一份 classpath 把 server 拉起来当子进程。
+      -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <configuration>
+          <executable>java</executable>
+          <arguments>
+            <!--
+              Windows 中文乱码的坑，比看起来深：
+              Java 18+ 已经把 file.encoding 默认成 UTF-8，但 System.out 走的是
+              stdout.encoding，它在 Windows 上仍然跟随控制台代码页（中文系统是 GBK）。
+              结果就是文件读写正常、println 出来的中文全乱。
+              必须单独指定 stdout/stderr 编码，缺一不可。
+            -->
+            <argument>-Dfile.encoding=UTF-8</argument>
+            <argument>-Dstdout.encoding=UTF-8</argument>
+            <argument>-Dstderr.encoding=UTF-8</argument>
+            <argument>-classpath</argument>
+            <classpath/>
+            <argument>${mainClass}</argument>
+            <argument>${appArgs}</argument>
+          </arguments>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
