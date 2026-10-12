@@ -18,7 +18,6 @@ mcp-java-tutorial\
 │   ├── 05-Demo4-安全与加固.md      ← ★ 三道墙
 │   ├── 06-项目整合与面试.md        ← 简历 + 面试话术
 │   │
-│   ├── 全量代码.md                 ← ★ 全部代码，照着敲
 │   ├── MCP-Java-从零到跑通.md      ← 技术详解手册（更深入，当参考书用）
 │   └── 只读数据库MCP.md            ← Demo 3/4 的设计说明
 ├── src\
@@ -51,10 +50,10 @@ mcp-java-tutorial\
 
 | 顺序 | 填哪个文件 | 文档章节 |
 |---|---|---|
-| 1 | `step1\CalculatorServer.java` | 全量代码 2.1 |
-| 2 | `step2\ManualClient.java` | 全量代码 2.2 |
-| 3 | `step3\McpToClaudeTool.java` | 全量代码 2.3 |
-| 4 | `step4\AgentMain.java` | 全量代码 2.4 |
+| 1 | `step1\CalculatorServer.java` | 02 篇 3.2 |
+| 2 | `step2\ManualClient.java` | 02 篇 3.3 |
+| 3 | `step3\McpToClaudeTool.java` | 03 篇 3.1 |
+| 4 | `step4\AgentMain.java` | 03 篇 3.2 |
 
 **注意第 2 步 —— 那里还没有 LLM。** 是你自己决定调 `add`、自己填参数。
 把这一步想明白，MCP 和 function calling 就永远不会再混淆了。

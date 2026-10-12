@@ -247,249 +247,142 @@ ServerParameters.builder("npx").args("-y", "@some/mcp-server").build()
 
 ## 三、完整代码实现
 
-### 3.1 项目配置
+这一节把本篇涉及的文件**完整列出**。建议边看边敲——配套工程里 `src/` 下的同名文件是空的。
 
-见 [`全量代码.md`](./全量代码.md) 第 1.1 节（`pom.xml`）。
-Demo 1 只需要 MCP SDK 和 slf4j，暂时用不到 anthropic-java。
+### 3.1 `pom.xml`
 
-### 3.2 MCP Server
+这是工程的完整 `pom.xml`。Demo 1 只会用到其中一部分（MCP SDK + slf4j），
+`h2` 和 `anthropic-java` 是后面几个 Demo 才用得上，现在放着不用管。
 
-完整代码见 **附录 A.1**。核心结构：
+注意 `exec` 插件里的三个编码参数和 `<classpath/>`——它们的必要性见第一节的坑 ② 和 ④。
 
-```java
-public final class CalculatorServer {
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
 
-    public static void main(String[] args) {
-        McpJsonMapper jsonMapper = new JacksonMcpJsonMapperSupplier().get();
+  <groupId>com.example.mcp</groupId>
+  <artifactId>mcp-java-tutorial</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+  <name>MCP Java Tutorial</name>
 
-        // ① 定义两个工具的 JSON Schema
-        Map<String, Object> addSchema = Map.of(
-                "type", "object",
-                "properties", Map.of(
-                        "a", Map.of("type", "integer", "description", "第一个加数"),
-                        "b", Map.of("type", "integer", "description", "第二个加数")
-                ),
-                "required", List.of("a", "b")
-        );
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- MCP 官方 Java SDK。2.0.0 是当前稳定版，对应 MCP 规范 2025-11-25 -->
+    <mcp.sdk.version>2.0.0</mcp.sdk.version>
+    <!-- Anthropic 官方 Java SDK -->
+    <anthropic.sdk.version>2.34.0</anthropic.sdk.version>
 
-        // ② 声明工具
-        McpSchema.Tool addTool = McpSchema.Tool.builder("add", addSchema)
-                .description("计算两个整数之和。当用户询问加法运算时使用。")
-                .build();
+    <!--
+      传给被测程序的参数。
+      为什么不用标准的 -Dexec.args？因为它会被 exec 插件插到【主类名之前】，
+      结果 java 把参数当成了主类名，报 ClassNotFoundException。
+      用自定义属性显式放进 <arguments> 里，位置才对。
+      用法：-DappArgs="你的问题"
+    -->
+    <appArgs></appArgs>
+  </properties>
 
-        // ③ 组装并启动
-        McpSyncServer server = McpServer.sync(lifecycle.provider())
-                .serverInfo("calc-server", "1.0.0")
-                .capabilities(McpSchema.ServerCapabilities.builder().tools(true).build())
-                .toolCall(addTool, (exchange, request) -> {
-                    int a = ((Number) request.arguments().get("a")).intValue();
-                    int b = ((Number) request.arguments().get("b")).intValue();
-                    return McpSchema.CallToolResult.builder()
-                            .addTextContent(a + " + " + b + " = " + (a + b))
-                            .build();
-                })
-                .build();
+  <dependencyManagement>
+    <dependencies>
+      <!-- BOM：统一管理 mcp / mcp-core / mcp-json-* 等模块的版本 -->
+      <dependency>
+        <groupId>io.modelcontextprotocol.sdk</groupId>
+        <artifactId>mcp-bom</artifactId>
+        <version>${mcp.sdk.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
-        lifecycle.awaitClientDisconnect();
-        server.closeGracefully();
-    }
-}
+  <dependencies>
+    <!-- 便捷包：= mcp-core + Jackson3 JSON 实现，含 STDIO / Streamable HTTP 传输 -->
+    <dependency>
+      <groupId>io.modelcontextprotocol.sdk</groupId>
+      <artifactId>mcp</artifactId>
+    </dependency>
+
+    <!-- 调用 Claude 用 -->
+    <dependency>
+      <groupId>com.anthropic</groupId>
+      <artifactId>anthropic-java</artifactId>
+      <version>${anthropic.sdk.version}</version>
+    </dependency>
+
+    <!--
+      H2：内存数据库，纯 Java、零安装。
+      用它只是为了让示例自包含——换成你真实的库，
+      只需要改 Db.java 里的 JDBC URL 和账号，其他代码一行不用动。
+    -->
+    <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <version>2.3.232</version>
+    </dependency>
+
+    <!--
+      日志。必须走 stderr！
+      STDIO 传输把 stdout 当作 JSON-RPC 通道，任何打到 stdout 的日志
+      都会污染协议流，导致客户端解析失败。slf4j-simple 默认输出到 System.err，
+      正好安全。这是 MCP 新手最常踩的坑。
+    -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>2.0.16</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!--
+        用 exec:exec 而不是 exec:java，是这里的关键。
+        exec:java 在同进程里跑，System.getProperty("java.class.path") 不可靠；
+        exec:exec 是真的 fork 一个 java 进程，classpath 是真的，
+        于是 step2 / step4 才能用同一份 classpath 把 server 拉起来当子进程。
+      -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.5.0</version>
+        <configuration>
+          <executable>java</executable>
+          <arguments>
+            <!--
+              Windows 中文乱码的坑，比看起来深：
+              Java 18+ 已经把 file.encoding 默认成 UTF-8，但 System.out 走的是
+              stdout.encoding，它在 Windows 上仍然跟随控制台代码页（中文系统是 GBK）。
+              结果就是文件读写正常、println 出来的中文全乱。
+              必须单独指定 stdout/stderr 编码，缺一不可。
+            -->
+            <argument>-Dfile.encoding=UTF-8</argument>
+            <argument>-Dstdout.encoding=UTF-8</argument>
+            <argument>-Dstderr.encoding=UTF-8</argument>
+            <argument>-classpath</argument>
+            <classpath/>
+            <argument>${mainClass}</argument>
+            <argument>${appArgs}</argument>
+          </arguments>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
 ```
 
-**四个值得停下来看的点：**
+### 3.2 `CalculatorServer.java`
 
-**① JSON Schema 就是普通的 JSON Schema**
+本篇主角。四个值得停下来看的点：
 
-MCP 没有发明新的 schema 语言，直接复用 JSON Schema。
-记住这一点——**Demo 2 里把 MCP 工具转成 Claude 工具之所以只要 30 行，就是因为两边用的是同一个东西。**
-
-**② `toolCall` 的 lambda 有两个参数**
-
-```java
-.toolCall(addTool, (exchange, request) -> { ... })
-```
-
-- `request` —— 含 `name()` 和 `arguments()`，就是调用方填的参数
-- `exchange` —— 用来**反向**跟客户端通信（Demo 1 用不到，但它是 MCP 比「普通函数注册」强的地方）
-
-**③ 参数取出来是 `Number` 不是 `int`**
-
-```java
-int a = ((Number) request.arguments().get("a")).intValue();
-```
-
-因为 `arguments()` 是 `Map<String, Object>`，JSON 数字反序列化后是 `Integer` 或 `Long`。
-直接强转 `(int)` 会 ClassCastException。
-
-**④ 结尾的 `lifecycle.awaitClientDisconnect()`**
-
-这不是可有可无的收尾。stdio server **在 stdin 关闭后不会自己退出**，
-用 `new CountDownLatch(1).await()` 永久阻塞的话，客户端一崩你就攒一堆孤儿进程。
-
-### 3.3 MCP Client
-
-完整代码见 **附录 A.2**。核心五步：
-
-```java
-// ① 描述"怎么启动 server"
-ServerParameters serverParams = ServerParameters.builder("java")
-        .args("-Dfile.encoding=UTF-8", "-Dstdout.encoding=UTF-8", "-Dstderr.encoding=UTF-8",
-              "-classpath", System.getProperty("java.class.path"),
-              "com.example.mcp.step1.CalculatorServer")
-        .build();
-
-// ② 建立连接
-McpSyncClient client = McpClient.sync(new StdioClientTransport(serverParams, jsonMapper))
-        .requestTimeout(Duration.ofSeconds(30))
-        .build();
-
-// ③ 握手
-client.initialize();
-client.getServerInfo();          // Implementation[name=calc-server, version=1.0.0]
-client.getServerCapabilities();  // 对方支持什么
-
-// ④ 发现工具
-McpSchema.ListToolsResult tools = client.listTools();
-for (McpSchema.Tool t : tools.tools()) {
-    System.out.println(t.name() + " : " + t.description());
-    System.out.println("  schema: " + t.inputSchema());
-}
-
-// ⑤ 调用工具
-McpSchema.CallToolResult r = client.callTool(
-        new McpSchema.CallToolRequest("add", Map.of("a", 3, "b", 4)));
-
-// 必须优雅关闭，否则 server 子进程会赖着不走
-client.closeGracefully();
-```
-
-**注意第 ④ 步打印出来的东西。**
-
-它和 `CalculatorServer` 里声明的 `name` / `description` / `inputSchema` **一模一样**，
-原样传过来的。
-
-在 Demo 1 里，它的用途是「让调用方知道能干什么」。
-**在 Demo 2 里你会看到，它恰好就是喂给 Claude 的工具清单——同一个返回值，两个用途。**
-
----
-
-## 四、测试与验证
-
-### 4.1 运行
-
-```bash
-mvn -q compile exec:exec -DmainClass=com.example.mcp.step2.ManualClient
-```
-
-### 4.2 预期输出
-
-见本文开头 1.2 节。
-
-### 4.3 重点看最后一段：参数校验
-
-Demo 里故意调了一次 `add`，把 `a` 传成字符串：
-
-```java
-client.callTool(new McpSchema.CallToolRequest("add", Map.of("a", "不是数字", "b", 1)));
-```
-
-输出：
-
-```
-isError = true
-content = Tool (add) input validation failed: Validation failed:
-          JSON schema validation errors: [/a: 已找到 string，必须是 integer]
-```
-
-**这说明：SDK 默认会按 `inputSchema` 校验入参，不合法直接返回 `isError=true`，根本不进 handler。**
-
-这是一道免费的安全网。想关掉（不推荐）：server 端 `.validateToolInputs(false)`。
-
-**为什么说它是「免费」的？** 因为在 Demo 2 接上模型之后，参数就变成**模型生成的**了，
-可能是任何东西。有这道校验，你至少不用自己写参数校验逻辑。
-
----
-
-## 五、关键知识点总结
-
-### 5.1 一句话回顾整个 Demo
-
-> **MCP Client 通过 STDIO 启动一个 MCP Server 子进程，
-> 握手交换能力，然后用 JSON-RPC 调用它暴露的工具。全程不涉及任何 LLM。**
-
-### 5.2 架构速查
-
-```
-┌─────────────── Host（你的程序）───────────────┐
-│                                                │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐   │
-│  │ Client A │   │ Client B │   │ Client C │   │  ← Client 和 Server 是 1:1
-│  └────┬─────┘   └────┬─────┘   └────┬─────┘   │
-└───────┼──────────────┼──────────────┼─────────┘
-        │              │              │
-   ┌────▼────┐    ┌────▼────┐    ┌────▼────┐
-   │Server 1 │    │Server 2 │    │Server 3 │
-   │(文件系统)│    │(数据库)  │    │(自研)   │
-   └─────────┘    └─────────┘    └─────────┘
-```
-
-**一个 Host 持有多个 Client，每个 Client 连一个 Server。**
-不是「一个 Client 连多个 Server」——这是新手最常画错的图。
-
-### 5.3 面试常见问题
-
-**Q1：MCP 和 function calling 有什么区别？**
-
-它们是正交的两层，不是竞品。
-
-- **Function calling** 是模型侧的机制：模型输出 `tool_use` 块，表示「我想调用某个工具」
-- **MCP** 是工具侧的机制：工具怎么被发现（`tools/list`）、怎么被调用（`tools/call`）
-
-两个可以独立存在：MCP Server 可以被完全没有 LLM 的程序使用（本 Demo 就是）；
-function calling 也可以调用完全不走 MCP 的、你手写的工具。
-
-**Q2：MCP 的通信协议是什么？**
-
-底层是 **JSON-RPC 2.0**。MCP 没有重新发明 RPC，只是约定了一套方法名
-（`initialize` / `tools/list` / `tools/call` 等）和消息结构。
-
-**Q3：MCP 有哪几种传输方式？怎么选？**
-
-- **STDIO**：本地子进程，客户端 fork server，用 stdin/stdout 通信。部署简单、天然安全。
-- **Streamable HTTP**：远程服务，一个 HTTP endpoint。
-
-判断标准很简单：server 和 host 在同一台机器上 → STDIO；server 独立部署 → Streamable HTTP。
-
-（历史上的 HTTP+SSE 传输**已废弃**，新项目不要用。）
-
-**Q4：为什么 MCP 要有握手（initialize）这一步？**
-
-因为 MCP 是**双向**协议，Server 也可能反向请求 Client（比如 sampling、elicitation）。
-双方必须先声明自己支持哪些能力，**只有双方都声明支持的能力才能用**。
-
-**Q5：STDIO 传输最容易踩的坑是什么？**
-
-**stdout 被污染。** stdout 是 JSON-RPC 的独占通道，任何
-`System.out.println`、日志框架的默认 stdout 输出、依赖库的 print，
-都会破坏协议流，导致客户端解析失败或直接卡死。
-
-解法：日志统一走 stderr。
-
----
-
-**下一节：** [Demo 2 - 接上 LLM](./03-Demo2-接上LLM.md)
-
----
-
-## 附录：完整代码
-
-> 这一篇涉及的文件都在下面，可以直接照着敲。
->
-> 配套工程里 `src/` 下的同名文件是空的，填完可以对照。
-
-### A.1 `CalculatorServer.java`
-
-**路径**：`src/main/java/com/example/mcp/step1/CalculatorServer.java`
+- **JSON Schema 就是普通的 JSON Schema** —— 记住这一点，下一篇桥接层为什么只要 30 行全靠它
+- **`toolCall` 的 lambda 有两个参数**：`request` 是调用方填的参数；`exchange` 用来反向跟客户端通信（本 Demo 用不到，但它是 MCP 比「普通函数注册」强的地方）
+- **参数取出来是 `Number` 不是 `int`**：`arguments()` 返回 `Map<String, Object>`，直接强转 `(int)` 会 ClassCastException
+- **结尾的 `lifecycle.awaitClientDisconnect()` 不能省** —— 它的实现就是本篇最后一个文件
 
 ```java
 package com.example.mcp.step1;
@@ -619,9 +512,15 @@ public final class CalculatorServer {
 }
 ```
 
-### A.2 `ManualClient.java`
+### 3.3 `ManualClient.java`
 
-**路径**：`src/main/java/com/example/mcp/step2/ManualClient.java`
+客户端五步：描述启动命令 → 建立连接 → 握手 → 发现工具 → 调用工具。
+
+一个关键设计藏在第一步里：`ServerParameters` 描述的是**「怎么启动一个进程」**，而不是「调用哪个类」。
+换成 Python 写的 server 就是 `builder("python").args("-m", "xxx")`——客户端完全不需要知道对面是什么语言写的。
+
+另一把钥匙在第四步：`listTools()` 返回的东西和 server 端声明的一模一样。
+**它就是下一篇喂给 Claude 的工具清单。**
 
 ```java
 package com.example.mcp.step2;
@@ -763,9 +662,16 @@ public final class ManualClient {
 }
 ```
 
-### A.3 `StdioLifecycle.java`
+### 3.4 `StdioLifecycle.java`
 
-**路径**：`src/main/java/com/example/mcp/core/StdioLifecycle.java`
+第一节「五个坑」里第 ③ 条的解法就在这个文件。
+
+思路：既然 SDK 不给「会话已关闭」的回调，就自己造一个信号——
+**把 `System.in` 包一层，一旦读到 EOF（-1）就释放 latch**。
+stdin 关闭 == 客户端已断开，这是 stdio 传输下最可靠的断连信号。
+
+⚠️ 注意 `EofAwareInputStream` 覆盖了**两个** `read` 重载。
+只覆盖一个的话，EOF 检测在真实场景里可能永远不触发。
 
 ```java
 package com.example.mcp.core;
@@ -882,3 +788,114 @@ public final class StdioLifecycle {
     }
 }
 ```
+
+---
+
+## 四、测试与验证
+
+### 4.1 运行
+
+```bash
+mvn -q compile exec:exec -DmainClass=com.example.mcp.step2.ManualClient
+```
+
+### 4.2 预期输出
+
+见本文开头 1.2 节。
+
+### 4.3 重点看最后一段：参数校验
+
+Demo 里故意调了一次 `add`，把 `a` 传成字符串：
+
+```java
+client.callTool(new McpSchema.CallToolRequest("add", Map.of("a", "不是数字", "b", 1)));
+```
+
+输出：
+
+```
+isError = true
+content = Tool (add) input validation failed: Validation failed:
+          JSON schema validation errors: [/a: 已找到 string，必须是 integer]
+```
+
+**这说明：SDK 默认会按 `inputSchema` 校验入参，不合法直接返回 `isError=true`，根本不进 handler。**
+
+这是一道免费的安全网。想关掉（不推荐）：server 端 `.validateToolInputs(false)`。
+
+**为什么说它是「免费」的？** 因为在 Demo 2 接上模型之后，参数就变成**模型生成的**了，
+可能是任何东西。有这道校验，你至少不用自己写参数校验逻辑。
+
+---
+
+## 五、关键知识点总结
+
+### 5.1 一句话回顾整个 Demo
+
+> **MCP Client 通过 STDIO 启动一个 MCP Server 子进程，
+> 握手交换能力，然后用 JSON-RPC 调用它暴露的工具。全程不涉及任何 LLM。**
+
+### 5.2 架构速查
+
+```
+┌─────────────── Host（你的程序）───────────────┐
+│                                                │
+│  ┌──────────┐   ┌──────────┐   ┌──────────┐   │
+│  │ Client A │   │ Client B │   │ Client C │   │  ← Client 和 Server 是 1:1
+│  └────┬─────┘   └────┬─────┘   └────┬─────┘   │
+└───────┼──────────────┼──────────────┼─────────┘
+        │              │              │
+   ┌────▼────┐    ┌────▼────┐    ┌────▼────┐
+   │Server 1 │    │Server 2 │    │Server 3 │
+   │(文件系统)│    │(数据库)  │    │(自研)   │
+   └─────────┘    └─────────┘    └─────────┘
+```
+
+**一个 Host 持有多个 Client，每个 Client 连一个 Server。**
+不是「一个 Client 连多个 Server」——这是新手最常画错的图。
+
+### 5.3 面试常见问题
+
+**Q1：MCP 和 function calling 有什么区别？**
+
+它们是正交的两层，不是竞品。
+
+- **Function calling** 是模型侧的机制：模型输出 `tool_use` 块，表示「我想调用某个工具」
+- **MCP** 是工具侧的机制：工具怎么被发现（`tools/list`）、怎么被调用（`tools/call`）
+
+两个可以独立存在：MCP Server 可以被完全没有 LLM 的程序使用（本 Demo 就是）；
+function calling 也可以调用完全不走 MCP 的、你手写的工具。
+
+**Q2：MCP 的通信协议是什么？**
+
+底层是 **JSON-RPC 2.0**。MCP 没有重新发明 RPC，只是约定了一套方法名
+（`initialize` / `tools/list` / `tools/call` 等）和消息结构。
+
+**Q3：MCP 有哪几种传输方式？怎么选？**
+
+- **STDIO**：本地子进程，客户端 fork server，用 stdin/stdout 通信。部署简单、天然安全。
+- **Streamable HTTP**：远程服务，一个 HTTP endpoint。
+
+判断标准很简单：server 和 host 在同一台机器上 → STDIO；server 独立部署 → Streamable HTTP。
+
+（历史上的 HTTP+SSE 传输**已废弃**，新项目不要用。）
+
+**Q4：为什么 MCP 要有握手（initialize）这一步？**
+
+因为 MCP 是**双向**协议，Server 也可能反向请求 Client（比如 sampling、elicitation）。
+双方必须先声明自己支持哪些能力，**只有双方都声明支持的能力才能用**。
+
+**Q5：STDIO 传输最容易踩的坑是什么？**
+
+**stdout 被污染。** stdout 是 JSON-RPC 的独占通道，任何
+`System.out.println`、日志框架的默认 stdout 输出、依赖库的 print，
+都会破坏协议流，导致客户端解析失败或直接卡死。
+
+解法：日志统一走 stderr。
+
+---
+
+**下一节：** [Demo 2 - 接上 LLM](./03-Demo2-接上LLM.md)
+
+---
+

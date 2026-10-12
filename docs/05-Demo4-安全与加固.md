@@ -1,6 +1,6 @@
 # Demo 4 - 安全与加固
 
-> 本篇完整代码见文末 **附录：完整代码**（4 个文件全在）
+> 本篇完整代码见 **第三节**（4 个文件全在）
 > 设计说明见 [`只读数据库MCP.md`](./只读数据库MCP.md) 第 3 节
 > 涉及文件：`db/SqlGuard.java`、`db/AuditLog.java`
 
@@ -296,296 +296,21 @@ stdout 是 MCP 的协议通道，写进去会污染协议流。
 
 ## 三、完整代码实现
 
-### 3.1 `SqlGuard.java`
+这一节把本篇涉及的四个文件**完整列出**。
 
-完整代码见 **附录 A.1**。
+### 3.1 `SqlGuard.java` —— SQL 安全层
 
-两个关键方法的骨架：
+★ 整篇最重要的文件。核心是**掩码 + 分词 + 白名单**，代码里的注释解释了每一处为什么这么写。
 
-```java
-/** 掩码：把字符串/注释替换成等长空格。长度必须保持不变。 */
-static String mask(String sql) {
-    char[] out = sql.toCharArray();   // 先复制一份，在原位置上改
-    int i = 0, n = sql.length();
+几个值得停下来看的点：
 
-    while (i < n) {
-        char c = sql.charAt(i);
+- **`mask()` 那个手写状态机**：要正确处理 `''` 转义引号、注释里包引号、引号里包注释、未闭合引号。正则做不到这些
+- **掩码为什么必须「等长」**：这样掩码串和原串下标一一对应，`enforceLimit()` 才能直接在掩码里定位、在原串上修改
+- **`BANNED_KEYWORDS` 里的 `INTO`**：最容易漏的一个——`SELECT ... INTO` 看起来是查询，其实在创建新表
+- **`tokenize()` 用整词匹配而不是子串匹配**：否则 `WHERE code LIKE 'UPDATED%'` 里的 `UPDATED` 会被误判成 `UPDATE`
 
-        if (c == '\'') {
-            out[i] = ' '; i++;
-            while (i < n) {
-                if (sql.charAt(i) == '\'') {
-                    if (i + 1 < n && sql.charAt(i + 1) == '\'') {
-                        // '' 是转义引号，还在字符串里
-                        out[i] = ' '; out[i + 1] = ' '; i += 2; continue;
-                    }
-                    out[i] = ' '; i++; break;
-                }
-                out[i] = ' '; i++;
-            }
-        } else if (c == '"') {
-            ... 双引号标识符
-        } else if (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {
-            ... 行注释
-        } else if (c == '/' && i + 1 < n && sql.charAt(i + 1) == '*') {
-            ... 块注释
-        } else {
-            i++;   // 普通字符，原样保留
-        }
-    }
-    return new String(out);
-}
-```
-
-**注意 `out` 是 `sql.toCharArray()` 的副本**，
-我们在副本上把「不该看的内容」改成空格，长度自然保持不变。
-
-### 3.2 `AuditLog.java`
-
-完整代码见 **附录 A.2**。
-
-```java
-Files.writeString(LOG_FILE, line, StandardCharsets.UTF_8,
-        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-```
-
-三个细节：
-
-- `StandardCharsets.UTF_8` —— 不加中文会乱码
-- `CREATE + APPEND` —— 首次自动建文件，之后追加
-- `synchronized` —— 多线程下别把行写串了
-
-### 3.3 `Db.java` 里的只读账号
-
-完整代码见 Demo 3 篇的 **附录 A.1**（`Db.java`）。
-
-```java
-private static void createReadOnlyAccount(Statement st) throws SQLException {
-    st.execute("CREATE USER IF NOT EXISTS " + READONLY_USER
-            + " PASSWORD '" + READONLY_PASSWORD + "'");
-    st.execute("GRANT SELECT ON SCHEMA PUBLIC TO " + READONLY_USER);
-}
-```
-
-**⚠️ 顺序要求：必须在所有表建好之后调用**，
-`GRANT SELECT ON SCHEMA` 才能覆盖到全部表。
-
----
-
-## 四、测试与验证
-
-**这一节的验证程序是三步中最完整的，跑一遍就知道三道墙有没有生效。**
-
-### 4.1 功能 + 攻击 + 误伤（不需要 API Key）
-
-```bash
-mvn -q compile exec:exec -DmainClass=com.example.mcp.db.DbClientDemo
-```
-
-#### ① 正常功能
-
-```
-── list_tables ──
-共 5 张表：
-| 表名 | 行数 | 说明 |
-|---|---:|---|
-| DEVICE_LOG | 5000 | 设备运行日志，数据量较大... |
-| SPARE_PART | 10 | 备件物料主数据 |
-...
-
-── describe_table(spare_usage) ──
-表 SPARE_USAGE —— 备件领用记录，一行代表一次领用
-| 字段名 | 类型 | 可空 | 主键 | 说明 |
-...
-```
-
-#### ② 攻击用例 —— 应该全部被拒绝
-
-```
-✅ 删表              SQL 被拒绝：只允许 SELECT 查询，当前以 DELETE 开头
-✅ 改数据            SQL 被拒绝：只允许 SELECT 查询，当前以 UPDATE 开头
-✅ 堆叠语句          SQL 被拒绝：不允许一次执行多条 SQL 语句
-✅ SELECT INTO 建表  SQL 被拒绝：SQL 中包含禁止的关键字：INTO
-✅ 读服务器文件       SQL 被拒绝：SQL 中包含禁止的关键字：FILE_READ
-✅ 注释隐藏关键字     SEL/**/ECT 1; DE/**/LETE FROM spare_part → 被拦截
-✅ 行注释隐藏        SELECT 1 -- \n; DROP TABLE spare_part → 被拦截
-```
-
-**注意最后两条。** 它们用的是攻击者常用手法：
-
-```sql
-SEL/**/ECT 1; DE/**/LETE FROM spare_part    -- 用块注释拼接关键字
-SELECT 1 -- 换行 ; DROP TABLE spare_part      -- 用行注释吞掉后半句
-```
-
-掩码之后注释变成空格，关键字就暴露出来了。
-
-#### ③ 误伤检查 —— 应该全部放行
-
-```
-✅ 字符串里的关键字不算数      SELECT * FROM spare_part WHERE name = 'delete me'
-✅ 字段名含关键字子串         WHERE code LIKE 'UPDATED%'
-✅ 没写 LIMIT（5000行表）    → 200 行 ⚠️ 已达返回上限 200 行
-✅ 超大 LIMIT 应被收敛       LIMIT 999999 → 200 行
-✅ 聚合查询不受限（正确姿势）  GROUP BY level → 3 行
-✅ CTE 查询                WITH recent AS (...) SELECT ...
-```
-
-> **★ 误伤检查和安全检查同样重要。**
-> **一个把正常查询也拦掉的安全层，等于没有。**
-
-注意 `LIMIT 999999` 被收敛到了 200——这就是 Demo 3 里那张 5000 行大表存在的意义。
-
-### 4.2 只读账号（不需要 API Key）
-
-```bash
-mvn -q compile exec:exec -DmainClass=com.example.mcp.db.ReadOnlyAccountDemo
-```
-
-**这个测试绕过了全部 Java 代码，直接用只读账号连库。**
-
-```
-已用只读账号 app_readonly 建立连接，尝试执行写操作：
-（这些操作全部绕过了 SqlGuard，直接打到数据库）
-
-✅ DELETE FROM spare_part      → Not enough rights for object "PUBLIC.SPARE_PART"
-✅ DROP TABLE spare_part       → Not enough rights for object "PUBLIC.SPARE_PART"
-✅ TRUNCATE TABLE spare_usage  → Not enough rights for object "PUBLIC.SPARE_USAGE"
-✅ INSERT INTO spare_part ...  → Not enough rights for object "PUBLIC.SPARE_PART"
-✅ UPDATE spare_stock ...      → Not enough rights for object "PUBLIC.SPARE_STOCK"
-
-对照组 —— 读操作应该正常：
-✅ SELECT COUNT(*) FROM spare_part   → 10 行
-✅ SELECT COUNT(*) FROM spare_usage  → 15 行
-```
-
-**为什么这个测试必须存在？**
-
-因为 4.1 测的是 SqlGuard（第二道墙）。
-但它挡不住「绕过 Java 代码直接连库」的攻击。
-
-**只读账号必须单独验证**——你不能假设它有效，得亲眼看到它把 `DELETE` 拒掉。
-
-> 顺带一个技术细节：这个测试**不能**写在 `DbClientDemo` 里。
-> 因为 H2 内存库是 **per-JVM** 的，客户端进程里连的是「本进程的空库」，
-> 不是 server 子进程里那个库。所以必须单独一个 main 类。
-
-### 4.3 审计日志
-
-跑完上面两个，看 `mcp-audit.log`：
-
-```
-2026-10-10 12:04:30.099 | run_query | PASS |  13ms | SELECT p.code, p.name, SUM(u.quantity) ... | ok
-2026-10-10 12:04:30.103 | run_query | DENY |   0ms | DELETE FROM spare_part | 只允许 SELECT 查询...
-2026-10-10 12:04:30.109 | run_query | DENY |   0ms | SELECT * FROM spare_part; DROP TABLE spare_part | 不允许一次执行多条...
-```
-
----
-
-## 五、关键知识点总结
-
-### 5.1 一句话回顾整个 Demo
-
-> **安全必须做在模型管不到的地方。SqlGuard 挡误操作，只读账号挡攻击，
-> 两者定位不同，缺一不可。**
-
-### 5.2 三道墙速查
-
-
-| 墙 | 实现 | 挡什么 | 能不能被绕过 |
-| --- | --- | --- | --- |
-| ① 只读账号 | `GRANT SELECT` | 所有写操作 | ❌ 绕不过（数据库强制） |
-| ② SqlGuard | 掩码 + 白名单 | 模型写错的 SQL | ⚠️ 理论上有绕过路径 |
-| ③ 超时限流 | `setQueryTimeout` + `LIMIT` | 资源耗尽 | — |
-
-**记住这个优先级：① > ② > ③。**
-如果只能做一件，做 ①。
-
-### 5.3 面试常见问题
-
-**Q1：为什么不直接在 system prompt 里写「只允许 SELECT」？**
-
-因为 prompt 不是安全边界。三个理由：
-
-1. **模型会犯错** —— 你说「删掉过期记录」，它可能真生成 DELETE
-2. **模型会被操纵** —— 提示注入可以绕过任何提示词约束
-3. **安全必须是确定性的** —— 不能依赖概率性组件每次都做对
-
-**正确做法是把边界做在模型管不到的地方**：数据库权限、代码层的 SQL 校验。
-
-**Q2：什么是提示注入？为什么 AI 应用要特别防它？**
-
-指攻击者把恶意指令藏在模型会读到的数据里，诱导模型执行。
-
-最常见的是**间接提示注入**：攻击载荷藏在数据库内容、网页、文档里，
-用户完全不知情，只是让 AI「读一下这份文档」。
-
-**为什么难防？** 因为在模型眼里，「用户的指令」和「读到的数据」都是文本，
-它没有可靠的机制区分两者。这也是为什么不能靠 prompt 做安全边界。
-
-**Q3：为什么 SQL 校验要「掩码」？直接正则匹配关键字不行吗？**
-
-不行，会有两个问题：
-
-- **误伤**：`WHERE name = 'delete me'` 里的 DELETE 是数据，不是语法
-- **被绕过**：攻击者可以用字符串拼接、注释等手段构造
-
-掩码是把字符串字面量、引号标识符、注释全部替换成空格，
-**只留「语法」给校验器看**，两个问题一起解决。
-
-**Q4：为什么掩码要「等长」？**
-
-这样掩码串和原串的字符下标一一对应，
-后面定位和修改 `LIMIT` 时可以直接用掩码里找到的位置去改原串。
-
-如果长度不等，就得维护两套下标映射。
-
-**Q5：手写 SQL 解析器安全吗？**
-
-**不安全，而且理论上不可能做到完备。**
-
-SQL 语法极其复杂：方言差异、嵌套注释、Unicode 同形字、
-存储过程里的动态 SQL……任何手写解析器都有绕过路径。
-
-所以正确的定位是：
-
-- **SqlGuard 用来挡「模型不小心写错」**（占 99%），它给出清晰的错误信息让模型改正
-- **只读账号用来挡「有人故意绕过」**（占 1%，但后果严重）
-
-**只做 SqlGuard 不做只读账号，是典型的「看起来安全」。**
-
-**Q6：只读账号就够了吗？**
-
-不够。只读解决的是「数据被改」，**不解决「数据库被拖垮」**。
-
-一条没加索引的 JOIN 在千万行表上照样能把生产库拖垮。
-所以要配 ③：查询超时 + 结果行数上限。
-
-**Q7：为什么要记录被拒绝的请求？**
-
-因为被拒绝的比成功的更有信息量——**它告诉你模型想干什么但没干成**。
-
-如果审计日志里连续出现 `DENY: DELETE FROM ...`，
-说明模型正在尝试写操作，可能是：
-提示被误解、工具描述有歧义、或者有人在尝试提示注入。
-
-**这是最早能发现异常的信号。**
-
----
-
-**下一节：** [项目整合与面试](./06-项目整合与面试.md)
-
----
-
-## 附录：完整代码
-
-> 这一篇涉及的文件都在下面，可以直接照着敲。
->
-> 配套工程里 `src/` 下的同名文件是空的，填完可以对照。
-
-### A.1 `SqlGuard.java`
-
-**路径**：`src/main/java/com/example/mcp/db/SqlGuard.java`
+⚠️ 但请记住这个类的定位：**它是第二道墙，不是唯一一道。** 手写的 SQL 解析器理论上不可能完备，
+真正挡住攻击的是 3.4 节那个只读账号。
 
 ```java
 package com.example.mcp.db;
@@ -891,9 +616,18 @@ public final class SqlGuard {
 }
 ```
 
-### A.2 `AuditLog.java`
+### 3.2 `AuditLog.java` —— 审计日志
 
-**路径**：`src/main/java/com/example/mcp/db/AuditLog.java`
+出事了靠它。**关键是它记录的内容包含被拒绝的请求**——被拒绝的比成功的更有信息量，
+它告诉你模型想干什么但没干成。
+
+三个实现细节：
+
+- `StandardCharsets.UTF_8` —— 不加中文会乱码
+- `CREATE + APPEND` —— 首次自动建文件，之后追加
+- `synchronized` —— 多线程下别把行写串了
+
+⚠️ 还有个容易忽略的：**审计日志写文件，不写 stdout**。stdout 是 MCP 的协议通道。
 
 ```java
 package com.example.mcp.db;
@@ -975,9 +709,16 @@ public final class AuditLog {
 }
 ```
 
-### A.3 `DbClientDemo.java`
+### 3.3 `DbClientDemo.java` —— 验证程序
 
-**路径**：`src/main/java/com/example/mcp/db/DbClientDemo.java`
+这一篇的「裁判」。跑一遍就知道三道墙有没有生效，而且**不需要 API Key**。
+
+它分四部分：① 正常功能 ② 7 个攻击用例 ③ 5 个误伤检查 ④ 指向只读账号的验证。
+
+其中 ③ 和 ② 一样重要——**一个把正常查询也拦掉的安全层，等于没有。**
+
+注意「没写 LIMIT」和「超大 LIMIT」两个用例用的是 5000 行的 `device_log`，
+不是 15 行的 `spare_usage`。小表测不出限流机制。
 
 ```java
 package com.example.mcp.db;
@@ -1161,9 +902,14 @@ public final class DbClientDemo {
 }
 ```
 
-### A.4 `ReadOnlyAccountDemo.java`
+### 3.4 `ReadOnlyAccountDemo.java` —— 只读账号验证
 
-**路径**：`src/main/java/com/example/mcp/db/ReadOnlyAccountDemo.java`
+**这个测试绕过了全部 Java 代码，直接用只读账号连库。** 这是唯一能证明第一道墙有效的方法——
+你不能假设它有效，得亲眼看到 `DELETE` 被拒。
+
+⚠️ 一个技术细节：它**不能**写在 `DbClientDemo` 里。
+因为 H2 内存库是 **per-JVM** 的，客户端进程里连的是「本进程的空库」，
+不是 server 子进程里那个库。所以必须单独一个 main 类。
 
 ```java
 package com.example.mcp.db;
@@ -1262,3 +1008,210 @@ public final class ReadOnlyAccountDemo {
     }
 }
 ```
+
+---
+
+## 四、测试与验证
+
+**这一节的验证程序是三步中最完整的，跑一遍就知道三道墙有没有生效。**
+
+### 4.1 功能 + 攻击 + 误伤（不需要 API Key）
+
+```bash
+mvn -q compile exec:exec -DmainClass=com.example.mcp.db.DbClientDemo
+```
+
+#### ① 正常功能
+
+```
+── list_tables ──
+共 5 张表：
+| 表名 | 行数 | 说明 |
+|---|---:|---|
+| DEVICE_LOG | 5000 | 设备运行日志，数据量较大... |
+| SPARE_PART | 10 | 备件物料主数据 |
+...
+
+── describe_table(spare_usage) ──
+表 SPARE_USAGE —— 备件领用记录，一行代表一次领用
+| 字段名 | 类型 | 可空 | 主键 | 说明 |
+...
+```
+
+#### ② 攻击用例 —— 应该全部被拒绝
+
+```
+✅ 删表              SQL 被拒绝：只允许 SELECT 查询，当前以 DELETE 开头
+✅ 改数据            SQL 被拒绝：只允许 SELECT 查询，当前以 UPDATE 开头
+✅ 堆叠语句          SQL 被拒绝：不允许一次执行多条 SQL 语句
+✅ SELECT INTO 建表  SQL 被拒绝：SQL 中包含禁止的关键字：INTO
+✅ 读服务器文件       SQL 被拒绝：SQL 中包含禁止的关键字：FILE_READ
+✅ 注释隐藏关键字     SEL/**/ECT 1; DE/**/LETE FROM spare_part → 被拦截
+✅ 行注释隐藏        SELECT 1 -- \n; DROP TABLE spare_part → 被拦截
+```
+
+**注意最后两条。** 它们用的是攻击者常用手法：
+
+```sql
+SEL/**/ECT 1; DE/**/LETE FROM spare_part    -- 用块注释拼接关键字
+SELECT 1 -- 换行 ; DROP TABLE spare_part      -- 用行注释吞掉后半句
+```
+
+掩码之后注释变成空格，关键字就暴露出来了。
+
+#### ③ 误伤检查 —— 应该全部放行
+
+```
+✅ 字符串里的关键字不算数      SELECT * FROM spare_part WHERE name = 'delete me'
+✅ 字段名含关键字子串         WHERE code LIKE 'UPDATED%'
+✅ 没写 LIMIT（5000行表）    → 200 行 ⚠️ 已达返回上限 200 行
+✅ 超大 LIMIT 应被收敛       LIMIT 999999 → 200 行
+✅ 聚合查询不受限（正确姿势）  GROUP BY level → 3 行
+✅ CTE 查询                WITH recent AS (...) SELECT ...
+```
+
+> **★ 误伤检查和安全检查同样重要。**
+> **一个把正常查询也拦掉的安全层，等于没有。**
+
+注意 `LIMIT 999999` 被收敛到了 200——这就是 Demo 3 里那张 5000 行大表存在的意义。
+
+### 4.2 只读账号（不需要 API Key）
+
+```bash
+mvn -q compile exec:exec -DmainClass=com.example.mcp.db.ReadOnlyAccountDemo
+```
+
+**这个测试绕过了全部 Java 代码，直接用只读账号连库。**
+
+```
+已用只读账号 app_readonly 建立连接，尝试执行写操作：
+（这些操作全部绕过了 SqlGuard，直接打到数据库）
+
+✅ DELETE FROM spare_part      → Not enough rights for object "PUBLIC.SPARE_PART"
+✅ DROP TABLE spare_part       → Not enough rights for object "PUBLIC.SPARE_PART"
+✅ TRUNCATE TABLE spare_usage  → Not enough rights for object "PUBLIC.SPARE_USAGE"
+✅ INSERT INTO spare_part ...  → Not enough rights for object "PUBLIC.SPARE_PART"
+✅ UPDATE spare_stock ...      → Not enough rights for object "PUBLIC.SPARE_STOCK"
+
+对照组 —— 读操作应该正常：
+✅ SELECT COUNT(*) FROM spare_part   → 10 行
+✅ SELECT COUNT(*) FROM spare_usage  → 15 行
+```
+
+**为什么这个测试必须存在？**
+
+因为 4.1 测的是 SqlGuard（第二道墙）。
+但它挡不住「绕过 Java 代码直接连库」的攻击。
+
+**只读账号必须单独验证**——你不能假设它有效，得亲眼看到它把 `DELETE` 拒掉。
+
+> 顺带一个技术细节：这个测试**不能**写在 `DbClientDemo` 里。
+> 因为 H2 内存库是 **per-JVM** 的，客户端进程里连的是「本进程的空库」，
+> 不是 server 子进程里那个库。所以必须单独一个 main 类。
+
+### 4.3 审计日志
+
+跑完上面两个，看 `mcp-audit.log`：
+
+```
+2026-10-10 12:04:30.099 | run_query | PASS |  13ms | SELECT p.code, p.name, SUM(u.quantity) ... | ok
+2026-10-10 12:04:30.103 | run_query | DENY |   0ms | DELETE FROM spare_part | 只允许 SELECT 查询...
+2026-10-10 12:04:30.109 | run_query | DENY |   0ms | SELECT * FROM spare_part; DROP TABLE spare_part | 不允许一次执行多条...
+```
+
+---
+
+## 五、关键知识点总结
+
+### 5.1 一句话回顾整个 Demo
+
+> **安全必须做在模型管不到的地方。SqlGuard 挡误操作，只读账号挡攻击，
+> 两者定位不同，缺一不可。**
+
+### 5.2 三道墙速查
+
+
+| 墙 | 实现 | 挡什么 | 能不能被绕过 |
+| --- | --- | --- | --- |
+| ① 只读账号 | `GRANT SELECT` | 所有写操作 | ❌ 绕不过（数据库强制） |
+| ② SqlGuard | 掩码 + 白名单 | 模型写错的 SQL | ⚠️ 理论上有绕过路径 |
+| ③ 超时限流 | `setQueryTimeout` + `LIMIT` | 资源耗尽 | — |
+
+**记住这个优先级：① > ② > ③。**
+如果只能做一件，做 ①。
+
+### 5.3 面试常见问题
+
+**Q1：为什么不直接在 system prompt 里写「只允许 SELECT」？**
+
+因为 prompt 不是安全边界。三个理由：
+
+1. **模型会犯错** —— 你说「删掉过期记录」，它可能真生成 DELETE
+2. **模型会被操纵** —— 提示注入可以绕过任何提示词约束
+3. **安全必须是确定性的** —— 不能依赖概率性组件每次都做对
+
+**正确做法是把边界做在模型管不到的地方**：数据库权限、代码层的 SQL 校验。
+
+**Q2：什么是提示注入？为什么 AI 应用要特别防它？**
+
+指攻击者把恶意指令藏在模型会读到的数据里，诱导模型执行。
+
+最常见的是**间接提示注入**：攻击载荷藏在数据库内容、网页、文档里，
+用户完全不知情，只是让 AI「读一下这份文档」。
+
+**为什么难防？** 因为在模型眼里，「用户的指令」和「读到的数据」都是文本，
+它没有可靠的机制区分两者。这也是为什么不能靠 prompt 做安全边界。
+
+**Q3：为什么 SQL 校验要「掩码」？直接正则匹配关键字不行吗？**
+
+不行，会有两个问题：
+
+- **误伤**：`WHERE name = 'delete me'` 里的 DELETE 是数据，不是语法
+- **被绕过**：攻击者可以用字符串拼接、注释等手段构造
+
+掩码是把字符串字面量、引号标识符、注释全部替换成空格，
+**只留「语法」给校验器看**，两个问题一起解决。
+
+**Q4：为什么掩码要「等长」？**
+
+这样掩码串和原串的字符下标一一对应，
+后面定位和修改 `LIMIT` 时可以直接用掩码里找到的位置去改原串。
+
+如果长度不等，就得维护两套下标映射。
+
+**Q5：手写 SQL 解析器安全吗？**
+
+**不安全，而且理论上不可能做到完备。**
+
+SQL 语法极其复杂：方言差异、嵌套注释、Unicode 同形字、
+存储过程里的动态 SQL……任何手写解析器都有绕过路径。
+
+所以正确的定位是：
+
+- **SqlGuard 用来挡「模型不小心写错」**（占 99%），它给出清晰的错误信息让模型改正
+- **只读账号用来挡「有人故意绕过」**（占 1%，但后果严重）
+
+**只做 SqlGuard 不做只读账号，是典型的「看起来安全」。**
+
+**Q6：只读账号就够了吗？**
+
+不够。只读解决的是「数据被改」，**不解决「数据库被拖垮」**。
+
+一条没加索引的 JOIN 在千万行表上照样能把生产库拖垮。
+所以要配 ③：查询超时 + 结果行数上限。
+
+**Q7：为什么要记录被拒绝的请求？**
+
+因为被拒绝的比成功的更有信息量——**它告诉你模型想干什么但没干成**。
+
+如果审计日志里连续出现 `DENY: DELETE FROM ...`，
+说明模型正在尝试写操作，可能是：
+提示被误解、工具描述有歧义、或者有人在尝试提示注入。
+
+**这是最早能发现异常的信号。**
+
+---
+
+**下一节：** [项目整合与面试](./06-项目整合与面试.md)
+
+

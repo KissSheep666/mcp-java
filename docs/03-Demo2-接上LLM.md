@@ -277,259 +277,16 @@ Claude Opus 5 **默认开启思考**，而 `maxTokens` 是「思考 + 正文」�
 
 ## 三、完整代码实现
 
-### 3.1 桥接层
+这一节把本篇涉及的文件**完整列出**。建议边看边敲——配套工程里 `src/` 下的同名文件是空的。
 
-完整代码见 **附录 A.1**。
-核心逻辑已在 2.3 节列出，这里补充两个易错点：
+### 3.1 `McpToClaudeTool.java`
 
-```java
-// ⚠️ 易错点 1：required 为空时不要调用 .required(List.of())
-// 否则会序列化成 "required": []，虽然合法但没必要
-if (rawRequired instanceof List<?> required && !required.isEmpty()) {
-    schemaBuilder.required(...);
-}
+只有 30 行，原因 2.3 节已经讲了：**两边用的是同一套 JSON Schema**，所谓「转换」其实是「搬运」。
 
-// ⚠️ 易错点 2：description 为 null 要兜底
-// Claude 的 builder 不接受 null
-.description(mcpTool.description() == null ? "" : mcpTool.description())
-```
+两个易错点：
 
-### 3.2 agent loop
-
-完整代码见 **附录 A.2**。骨架：
-
-```java
-public final class AgentMain {
-
-    private static final String MODEL = "claude-opus-5";
-    private static final int MAX_TURNS = 10;   // 防御性上限
-
-    public static void main(String[] args) {
-        String question = ...;
-
-        // 准备 A：起 MCP client（和 Demo 1 完全一样）
-        McpSyncClient mcp = McpClient.sync(...).build();
-        mcp.initialize();
-
-        // 准备 B：起 Claude client（自动读 ANTHROPIC_API_KEY）
-        AnthropicClient claude = AnthropicOkHttpClient.fromEnv();
-
-        try {
-            // ① 工具转换：MCP 发现 → Claude 格式
-            List<Tool> claudeTools = mcp.listTools().tools().stream()
-                    .map(McpToClaudeTool::toClaudeTool)
-                    .toList();
-
-            List<MessageParam> messages = new ArrayList<>();
-            messages.add(MessageParam.builder()
-                    .role(MessageParam.Role.USER).content(question).build());
-
-            // ② agent loop
-            for (int turn = 1; turn <= MAX_TURNS; turn++) {
-
-                MessageCreateParams.Builder params = MessageCreateParams.builder()
-                        .model(MODEL)
-                        .maxTokens(16000L)          // 见 2.4 ⑥
-                        .messages(messages);
-                claudeTools.forEach(params::addTool);
-
-                Message response = claude.messages().create(params.build());
-
-                if (response.stopReason().orElse(null) == StopReason.REFUSAL) {
-                    ...                                     // 见 2.4 ②
-                    return;
-                }
-
-                List<ContentBlockParam> assistantBlocks = new ArrayList<>();
-                List<ContentBlockParam> toolResults = new ArrayList<>();
-
-                for (ContentBlock block : response.content()) {
-                    assistantBlocks.add(block.toParam());   // 见 2.4 ①
-
-                    if (!block.isToolUse()) {
-                        block.text().ifPresent(t -> System.out.println("Claude: " + t.text()));
-                        continue;
-                    }
-
-                    // ③ 模型要调工具了 —— MCP 出场
-                    ToolUseBlock toolUse = block.toolUse().orElseThrow();
-                    Map<String, Object> mcpArgs = toolUse._input().convert(Map.class);
-
-                    System.out.println("  [调用] " + toolUse.name() + " " + mcpArgs);
-
-                    McpSchema.CallToolResult mcpResult = mcp.callTool(
-                            new McpSchema.CallToolRequest(toolUse.name(), mcpArgs));
-
-                    String resultText = extractText(mcpResult);
-                    System.out.println("  [结果] " + resultText);
-
-                    toolResults.add(ContentBlockParam.ofToolResult(
-                            ToolResultBlockParam.builder()
-                                    .toolUseId(toolUse.id())
-                                    .content(resultText)
-                                    .isError(Boolean.TRUE.equals(mcpResult.isError()))  // 见 2.4 ④
-                                    .build()));
-                }
-
-                messages.add(MessageParam.builder()
-                        .role(MessageParam.Role.ASSISTANT)
-                        .contentOfBlockParams(assistantBlocks).build());
-
-                if (toolResults.isEmpty()) {                // 见 2.4 ⑤
-                    System.out.println("(共 " + turn + " 轮)");
-                    return;
-                }
-
-                messages.add(MessageParam.builder()         // 见 2.4 ③
-                        .role(MessageParam.Role.USER)
-                        .contentOfBlockParams(toolResults).build());
-            }
-
-            System.out.println("达到最大轮数 " + MAX_TURNS + "，强制结束。");
-
-        } finally {
-            mcp.closeGracefully();
-        }
-    }
-}
-```
-
-### 3.3 一个值得注意的设计
-
-```java
-int a = ((Number) request.arguments().get("a")).intValue();
-```
-
-对比一下两边参数的形状：
-
-```
-MCP 侧：   Map<String, Object>，值是 Object，要自己转型
-Claude 侧：toolUse._input().convert(Map.class)，也是 Map<String, Object>
-```
-
-**两边都是「松散 Map」，都不可信。** 这也是为什么 Demo 1 里那道
-自动参数校验很值钱——它替你挡住了模型可能生成的任何垃圾。
-
----
-
-## 四、测试与验证
-
-### 4.1 运行
-
-```bash
-# Windows cmd
-set ANTHROPIC_API_KEY=sk-ant-...
-mvn -q compile exec:exec -DmainClass=com.example.mcp.step4.AgentMain
-
-# 带自定义问题（注意用 -DappArgs=，不是 -Dexec.args=）
-mvn -q compile exec:exec -DmainClass=com.example.mcp.step4.AgentMain \
-    -DappArgs="北京天气怎么样？另外帮我算 999 加 111"
-```
-
-### 4.2 预期输出
-
-见本文开头 1.2 节。
-
-### 4.3 ★ 一个很好的练手实验
-
-用这个命令跑一次：
-
-```bash
-mvn -q compile exec:exec -DmainClass=com.example.mcp.step4.AgentMain \
-    -DappArgs="帮我算 999 乘 111"
-```
-
-**注意：我们的 MCP Server 里根本没有乘法工具。**
-
-观察模型会怎么做。它可能：
-
-- 老实说「我没有乘法工具」
-- 或者用加法硬凑（999×111 = 999×100 + 999×10 + 999×1……）
-
-**这是个很好的练习**，能让你直观感受到**工具描述对模型行为的引导作用**。
-如果你把 `add` 的描述改成「可以做加减乘除」，模型的行为会立刻不一样。
-
----
-
-## 五、关键知识点总结
-
-### 5.1 一句话回顾整个 Demo
-
-> **所谓 agent，就是一个 while 循环：把工具清单给模型 → 模型说要调哪个 →
-> 你去调 → 结果回传 → 直到模型不再要工具。**
-
-### 5.2 完整链路图
-
-```
-┌──────────┐    tool_use     ┌──────────────┐   JSON-RPC   ┌────────────┐
-│  Claude  │ ───────────────>│  你的代码     │ ────────────>│ MCP Server │
-│          │                 │              │              │            │
-│          │ <───────────────│  (agent loop)│ <────────────│  (工具)    │
-└──────────┘   tool_result   └──────────────┘   结果        └────────────┘
-     ↑                              │
-     │                              │ 只在这一层做格式转换
-     └──────────────────────────────┘ （30 行）
-```
-
-### 5.3 面试常见问题
-
-**Q1：agent 的核心是什么？**
-
-一个 while 循环。收到模型响应 → 检查有没有 `tool_use` → 有就执行并回传
-`tool_result` → 再发一次 → 直到模型返回 `end_turn`。
-
-所有 agent 框架剥掉包装都是这个循环。
-
-**Q2：tool_use 和 tool_result 怎么对应？**
-
-靠 ID。模型返回的 `tool_use` 块里有 `id`（形如 `toolu_abc123`），
-你回传 `tool_result` 时必须带 `tool_use_id` 指向同一个 ID。
-
-**漏掉任何一个 tool_use 对应的 tool_result，下一次请求会直接 400。**
-
-**Q3：模型一轮里请求了多个工具，结果要怎么回传？**
-
-**所有 `tool_result` 必须装在【同一条】user 消息里。**
-
-拆成多条不会报错，但会**悄悄训练模型不再并行调用工具**——
-你只会看到延迟慢慢变高，很难联想到原因。
-
-**Q4：为什么调用工具失败时也要回 `tool_result`？**
-
-两个原因：
-
-1. 不回的话，对话会卡在「有个 tool_use 没有对应结果」的非法状态，下次请求 400
-2. 要用 `is_error: true` 显式标记，否则模型会把错误信息当成**正常返回值**继续编
-
-**Q5：`maxTokens` 为什么不能给太小？**
-
-因为新版模型默认开启思考，而 `maxTokens` 是「思考 + 正文」的**总上限**。
-给紧了回答会在半路被截断。
-
-要控制成本应该调 `effort`（思考深度），而不是砍 `maxTokens`。
-
-**Q6：为什么模型返回的 thinking 块不能手动重建？**
-
-thinking 块带一个 `signature` 字段，是密码学签名，必须**逐字节原样保留**。
-手动重建会破坏签名，导致请求报错。
-
-Java SDK 提供 `block.toParam()` 做这个转换，直接用就行。
-
----
-
-**下一节：** [Demo 3 - 只读数据库 MCP](./04-Demo3-只读数据库MCP.md)
-
----
-
-## 附录：完整代码
-
-> 这一篇涉及的文件都在下面，可以直接照着敲。
->
-> 配套工程里 `src/` 下的同名文件是空的，填完可以对照。
-
-### A.1 `McpToClaudeTool.java`
-
-**路径**：`src/main/java/com/example/mcp/step3/McpToClaudeTool.java`
+- **`required` 为空时不要调用 `.required(List.of())`** —— 会序列化成 `"required": []`，虽然合法但没必要
+- **`description` 为 null 要兜底成空串** —— Claude 的 builder 不接受 null
 
 ```java
 package com.example.mcp.step3;
@@ -593,9 +350,13 @@ public final class McpToClaudeTool {
 }
 ```
 
-### A.2 `AgentMain.java`
+### 3.2 `AgentMain.java`
 
-**路径**：`src/main/java/com/example/mcp/step4/AgentMain.java`
+循环里六处「必须做对的地方」（2.4 节）在代码里都有对应注释，可以对照着看：
+
+`toParam()` 处理 thinking 块 · refusal 判断 · tool_result 合并成一条消息 · `is_error` 标记 · `toolResults.isEmpty()` 退出 · `maxTokens` 给足。
+
+留意 `MAX_TURNS` 那个防御性上限——它同时也回答了「agent 会不会失控」这个焦虑：**失控的边界是你自己设的。**
 
 ```java
 package com.example.mcp.step4;
@@ -855,9 +616,15 @@ public final class AgentMain {
 }
 ```
 
-### A.3 `McpAgent.java`
+### 3.3 `McpAgent.java`
 
-**路径**：`src/main/java/com/example/mcp/core/McpAgent.java`
+这是把 `AgentMain` 的循环抽出来给**实际项目**用的版本。教学版故意把循环写在 `main` 里，为的是一屏能看完；这个版本拆成了可复用的类。
+
+它比教学版多三件生产环境需要的东西：
+
+1. **Claude 客户端懒加载** —— 这样连 MCP 自检不需要 API Key。「连不上 server」和「没配 Key」两类错误也分开了，排查清楚得多
+2. **工具结果长度上限** —— 工具结果会进对话历史，而对话历史**每一轮都要完整重发**。一个 200 行表格塞进去，之后每轮都在为它付 token
+3. **工具崩溃时的兜底** —— 工具本身挂了也要回一条 `tool_result`（带 `isError`），否则对话会卡在「有 tool_use 没对应结果」的非法状态，下次请求直接 400
 
 ```java
 package com.example.mcp.core;
@@ -1162,3 +929,114 @@ public final class McpAgent implements AutoCloseable {
     }
 }
 ```
+
+---
+
+## 四、测试与验证
+
+### 4.1 运行
+
+```bash
+# Windows cmd
+set ANTHROPIC_API_KEY=sk-ant-...
+mvn -q compile exec:exec -DmainClass=com.example.mcp.step4.AgentMain
+
+# 带自定义问题（注意用 -DappArgs=，不是 -Dexec.args=）
+mvn -q compile exec:exec -DmainClass=com.example.mcp.step4.AgentMain \
+    -DappArgs="北京天气怎么样？另外帮我算 999 加 111"
+```
+
+### 4.2 预期输出
+
+见本文开头 1.2 节。
+
+### 4.3 ★ 一个很好的练手实验
+
+用这个命令跑一次：
+
+```bash
+mvn -q compile exec:exec -DmainClass=com.example.mcp.step4.AgentMain \
+    -DappArgs="帮我算 999 乘 111"
+```
+
+**注意：我们的 MCP Server 里根本没有乘法工具。**
+
+观察模型会怎么做。它可能：
+
+- 老实说「我没有乘法工具」
+- 或者用加法硬凑（999×111 = 999×100 + 999×10 + 999×1……）
+
+**这是个很好的练习**，能让你直观感受到**工具描述对模型行为的引导作用**。
+如果你把 `add` 的描述改成「可以做加减乘除」，模型的行为会立刻不一样。
+
+---
+
+## 五、关键知识点总结
+
+### 5.1 一句话回顾整个 Demo
+
+> **所谓 agent，就是一个 while 循环：把工具清单给模型 → 模型说要调哪个 →
+> 你去调 → 结果回传 → 直到模型不再要工具。**
+
+### 5.2 完整链路图
+
+```
+┌──────────┐    tool_use     ┌──────────────┐   JSON-RPC   ┌────────────┐
+│  Claude  │ ───────────────>│  你的代码     │ ────────────>│ MCP Server │
+│          │                 │              │              │            │
+│          │ <───────────────│  (agent loop)│ <────────────│  (工具)    │
+└──────────┘   tool_result   └──────────────┘   结果        └────────────┘
+     ↑                              │
+     │                              │ 只在这一层做格式转换
+     └──────────────────────────────┘ （30 行）
+```
+
+### 5.3 面试常见问题
+
+**Q1：agent 的核心是什么？**
+
+一个 while 循环。收到模型响应 → 检查有没有 `tool_use` → 有就执行并回传
+`tool_result` → 再发一次 → 直到模型返回 `end_turn`。
+
+所有 agent 框架剥掉包装都是这个循环。
+
+**Q2：tool_use 和 tool_result 怎么对应？**
+
+靠 ID。模型返回的 `tool_use` 块里有 `id`（形如 `toolu_abc123`），
+你回传 `tool_result` 时必须带 `tool_use_id` 指向同一个 ID。
+
+**漏掉任何一个 tool_use 对应的 tool_result，下一次请求会直接 400。**
+
+**Q3：模型一轮里请求了多个工具，结果要怎么回传？**
+
+**所有 `tool_result` 必须装在【同一条】user 消息里。**
+
+拆成多条不会报错，但会**悄悄训练模型不再并行调用工具**——
+你只会看到延迟慢慢变高，很难联想到原因。
+
+**Q4：为什么调用工具失败时也要回 `tool_result`？**
+
+两个原因：
+
+1. 不回的话，对话会卡在「有个 tool_use 没有对应结果」的非法状态，下次请求 400
+2. 要用 `is_error: true` 显式标记，否则模型会把错误信息当成**正常返回值**继续编
+
+**Q5：`maxTokens` 为什么不能给太小？**
+
+因为新版模型默认开启思考，而 `maxTokens` 是「思考 + 正文」的**总上限**。
+给紧了回答会在半路被截断。
+
+要控制成本应该调 `effort`（思考深度），而不是砍 `maxTokens`。
+
+**Q6：为什么模型返回的 thinking 块不能手动重建？**
+
+thinking 块带一个 `signature` 字段，是密码学签名，必须**逐字节原样保留**。
+手动重建会破坏签名，导致请求报错。
+
+Java SDK 提供 `block.toParam()` 做这个转换，直接用就行。
+
+---
+
+**下一节：** [Demo 3 - 只读数据库 MCP](./04-Demo3-只读数据库MCP.md)
+
+
